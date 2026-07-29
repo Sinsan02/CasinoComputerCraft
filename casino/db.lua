@@ -44,8 +44,12 @@ local function handle(req, db)
         if db.users[req.username] then
             return {ok=false, msg="Username is already taken"}
         end
-        -- First user to register automatically becomes admin
-        local is_admin = next(db.users) == nil
+        -- First real user to register automatically becomes admin (CASINO house account doesn't count)
+        local hasRealUser = false
+        for _, u in pairs(db.users) do
+            if not u.is_casino then hasRealUser = true; break end
+        end
+        local is_admin = not hasRealUser
         db.users[req.username] = {
             password = hash(req.password),
             chips    = 0,
@@ -150,7 +154,9 @@ local userCount = 0
 for _ in pairs(db.users) do userCount = userCount + 1 end
 term.setTextColor(colors.white)
 print("Users in DB: " .. userCount)
-if next(db.users) == nil then
+local hasRealUser = false
+for _, u in pairs(db.users) do if not u.is_casino then hasRealUser = true; break end end
+if not hasRealUser then
     term.setTextColor(colors.cyan)
     print("Empty DB - first registered user becomes admin!")
 end
