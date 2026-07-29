@@ -1,24 +1,24 @@
 -- dealer.lua
--- Texas Hold'em Dealer with betting
--- Dealer presses ENTER to start a round and to start a new round after showdown
--- Everything else (flop/turn/river/showdown) happens automatically when all players have acted
+-- Texas Hold'em Dealer with betting, blinds, auto-restart
 
 local dir   = fs.getDir(shell.getRunningProgram())
 local cards = dofile(fs.combine(dir, "cards.lua"))
 local eval  = dofile(fs.combine(dir, "eval.lua"))
 
-local PROTOCOL   = "txpoker"
+local PROTOCOL    = "txpoker"
 local MIN_PLAYERS = 2
 local MAX_PLAYERS = 5
 local MIN_RAISE   = 10
+local SMALL_BLIND = 10
+local BIG_BLIND   = 20
+local ROUND_DELAY = 8   -- seconds shown after each round before lobby
+local LOBBY_DELAY = 3   -- seconds in lobby before auto-deal
 
 -- =====================================================
 -- PERIPHERALS
 -- =====================================================
 local mon = peripheral.find("monitor")
-if not mon then
-    print("ERROR: No monitor found!"); return
-end
+if not mon then print("ERROR: No monitor found!"); return end
 mon.setTextScale(0.75)
 
 local modemName
@@ -36,18 +36,23 @@ rednet.open(modemName)
 -- GAME STATE
 -- =====================================================
 local game = {
-    phase       = "lobby",
-    deck        = {},
-    community   = {},
-    players     = {},
-    -- Player fields: {id, name, hand, balance, roundBet, totalBet, folded, allIn, acted}
-    pot         = 0,
-    currentBet  = 0,
-    actionIdx   = 1,   -- index in game.players for whose turn it is
-    betting     = false,
-    winner      = nil,
-    winHand     = nil,
-    results     = {},
+    phase      = "lobby",
+    deck       = {},
+    community  = {},
+    players    = {},
+    pot        = 0,
+    currentBet = 0,
+    actionIdx  = 1,
+    betting    = false,
+    winner     = nil,
+    winHand    = nil,
+    results    = {},
+    dealerBtn  = 0,  -- 1-indexed seat of dealer button
+    sbIdx      = 0,
+    bbIdx      = 0,
+    autoTimer  = nil,
+    countdown  = 0,
+    timerStage = 0,  -- 0=off 1=post-round countdown 2=lobby auto-start
 }
 
 -- =====================================================
@@ -64,7 +69,7 @@ end
 local function playerDataList()
     local list = {}
     for _, p in ipairs(game.players) do
-        list[#list + 1] = {
+        list[#list+1] = {
             name     = p.name,
             balance  = p.balance,
             roundBet = p.roundBet,
@@ -96,7 +101,6 @@ local function broadcastState()
 end
 
 -- =====================================================
--- =====================================================
 -- MONITOR DRAWING
 -- =====================================================
 local function mfill(x1, y1, x2, y2, char, bg)
@@ -105,7 +109,6 @@ local function mfill(x1, y1, x2, y2, char, bg)
     for y = y1, y2 do mon.setCursorPos(x1, y); mon.write(row) end
 end
 
--- Chip visualization
 local CHIP_DENOM = {
     {val=1000, clr=colors.red},
     {val=500,  clr=colors.purple},
@@ -134,8 +137,7 @@ local function drawChipRow(x, y, amount, maxW, bg)
     local count = math.min(#chips, maxW)
     mon.setCursorPos(x, y)
     for i = 1, count do
-        mon.setBackgroundColor(chips[i])
-        mon.write(" ")
+        mon.setBackgroundColor(chips[i]); mon.write(" ")
     end
     if count < maxW then
         mon.setBackgroundColor(bg)
@@ -145,7 +147,6 @@ local function drawChipRow(x, y, amount, maxW, bg)
     return count
 end
 
--- Community card (5w x 9h)
 local function drawMonCard(mx, my, card)
     if not card then
         mon.setBackgroundColor(colors.green)
@@ -157,25 +158,23 @@ local function drawMonCard(mx, my, card)
         return
     end
     local sClr = cards.CLR[card.suit]
-    local vL = string.format("%-3s", card.value):sub(1, 3)
+    local vL = string.format("%-3s", card.value):sub(1,3)
     local vR = string.format("%3s",  card.value):sub(-3)
-    mon.setBackgroundColor(colors.white)
-    mon.setTextColor(colors.black)
-    mon.setCursorPos(mx,     my    );  mon.write("+---+")
-    mon.setCursorPos(mx,     my + 1);  mon.write("|   |")
-    mon.setCursorPos(mx + 1, my + 1);  mon.setTextColor(sClr); mon.write(vL)
-    mon.setCursorPos(mx,     my + 2);  mon.setTextColor(colors.black); mon.write("|   |")
-    mon.setCursorPos(mx,     my + 3);  mon.write("|   |")
-    mon.setCursorPos(mx + 2, my + 3);  mon.setTextColor(sClr); mon.write(cards.SYM[card.suit])
-    mon.setCursorPos(mx,     my + 4);  mon.setTextColor(colors.black); mon.write("|   |")
-    mon.setCursorPos(mx,     my + 5);  mon.write("|   |")
-    mon.setCursorPos(mx,     my + 6);  mon.write("|   |")
-    mon.setCursorPos(mx + 1, my + 6);  mon.setTextColor(sClr); mon.write(vR)
-    mon.setCursorPos(mx,     my + 7);  mon.setTextColor(colors.black); mon.write("|   |")
-    mon.setCursorPos(mx,     my + 8);  mon.write("+---+")
+    mon.setBackgroundColor(colors.white); mon.setTextColor(colors.black)
+    mon.setCursorPos(mx,     my    ); mon.write("+---+")
+    mon.setCursorPos(mx,     my + 1); mon.write("|   |")
+    mon.setCursorPos(mx + 1, my + 1); mon.setTextColor(sClr); mon.write(vL)
+    mon.setCursorPos(mx,     my + 2); mon.setTextColor(colors.black); mon.write("|   |")
+    mon.setCursorPos(mx,     my + 3); mon.write("|   |")
+    mon.setCursorPos(mx + 2, my + 3); mon.setTextColor(sClr); mon.write(cards.SYM[card.suit])
+    mon.setCursorPos(mx,     my + 4); mon.setTextColor(colors.black); mon.write("|   |")
+    mon.setCursorPos(mx,     my + 5); mon.write("|   |")
+    mon.setCursorPos(mx,     my + 6); mon.write("|   |")
+    mon.setCursorPos(mx + 1, my + 6); mon.setTextColor(sClr); mon.write(vR)
+    mon.setCursorPos(mx,     my + 7); mon.setTextColor(colors.black); mon.write("|   |")
+    mon.setCursorPos(mx,     my + 8); mon.write("+---+")
 end
 
--- Mini card (3w x 1h); bg = surrounding background color
 local function drawMiniCard(mx, my, card, faceDown, bg)
     bg = bg or colors.green
     mon.setCursorPos(mx, my)
@@ -186,16 +185,11 @@ local function drawMiniCard(mx, my, card, faceDown, bg)
     else
         mon.setBackgroundColor(colors.white)
         mon.setTextColor(cards.CLR[card.suit])
-        mon.write(string.format("%-3s", card.value .. cards.SYM[card.suit]):sub(1, 3))
+        mon.write(string.format("%-3s", card.value .. cards.SYM[card.suit]):sub(1,3))
     end
     mon.setBackgroundColor(bg)
 end
 
--- Player slot (slotW x 4 rows):
---   Row 0: idx + name + [F/A] tag
---   Row 1: mini-cards + balance
---   Row 2: chip row + bet amount
---   Row 3: YOUR TURN / WINNER / hand name / folded
 local function drawPlayerSlot(x, y, player, idx, slotW)
     local isCurrent = game.betting and game.players[game.actionIdx] == player
     local isWinner  = game.winner and (
@@ -203,88 +197,79 @@ local function drawPlayerSlot(x, y, player, idx, slotW)
         game.winner:find(player.name, 1, true) ~= nil
     )
 
-    -- Lime background: bright on green table, good contrast
     local slotBg = isCurrent and colors.cyan or colors.lime
     mon.setBackgroundColor(slotBg)
     for dy = 0, 3 do
-        mon.setCursorPos(x, y + dy)
-        mon.write(string.rep(" ", slotW))
+        mon.setCursorPos(x, y + dy); mon.write(string.rep(" ", slotW))
     end
 
-    -- Row 0: idx + name + tag
-    local tag = player.folded and "[F]" or (player.allIn and "[A]" or "")
-    local nameMax = slotW - #tag - 3
-    local nameStr = string.format("%-" .. slotW .. "s",
-        idx .. ". " .. player.name:sub(1, nameMax) .. tag):sub(1, slotW)
-    local nameClr = colors.black
-    if isWinner        then nameClr = colors.yellow
-    elseif isCurrent   then nameClr = colors.black
-    elseif player.folded then nameClr = colors.gray
+    -- Row 0: seat# + name + role badge
+    local role = ""
+    if idx == game.dealerBtn then role = "[D]"
+    elseif idx == game.sbIdx  then role = "[S]"
+    elseif idx == game.bbIdx  then role = "[B]"
     end
-    mon.setCursorPos(x, y)
-    mon.setBackgroundColor(slotBg)
-    mon.setTextColor(nameClr)
+    local tag = player.folded and "[F]" or (player.allIn and "[A]" or "")
+    local badge   = role .. tag
+    local nameMax = slotW - #badge - 3
+    local nameStr = string.format("%-" .. slotW .. "s",
+        idx .. ". " .. player.name:sub(1, nameMax) .. badge):sub(1, slotW)
+    local nameClr = player.folded and colors.gray or (isWinner and colors.yellow or colors.black)
+    mon.setCursorPos(x, y); mon.setBackgroundColor(slotBg); mon.setTextColor(nameClr)
     mon.write(nameStr)
 
-    -- Row 1: mini-cards + balance
+    -- Row 1: cards + balance
     if player.folded then
-        -- Hide cards when folded
-        mon.setBackgroundColor(slotBg)
-        mon.setCursorPos(x, y+1)
+        mon.setBackgroundColor(slotBg); mon.setCursorPos(x, y+1)
         mon.setTextColor(colors.gray)
         mon.write(string.format("%-" .. slotW .. "s", "[folded]"):sub(1, slotW))
+    elseif #player.hand == 0 then
+        mon.setBackgroundColor(slotBg); mon.setCursorPos(x, y+1)
+        mon.setTextColor(colors.gray)
+        mon.write(string.format("%-" .. slotW .. "s", "[waiting]"):sub(1, slotW))
     else
         local showFace = (game.phase == "showdown")
-        drawMiniCard(x,   y+1, player.hand and player.hand[1], not showFace, slotBg)
+        drawMiniCard(x,   y+1, player.hand[1], not showFace, slotBg)
         mon.setBackgroundColor(slotBg); mon.setCursorPos(x+3, y+1); mon.write(" ")
-        drawMiniCard(x+4, y+1, player.hand and player.hand[2], not showFace, slotBg)
+        drawMiniCard(x+4, y+1, player.hand[2], not showFace, slotBg)
     end
-    mon.setBackgroundColor(slotBg)
-    mon.setTextColor(colors.black)
+    mon.setBackgroundColor(slotBg); mon.setTextColor(colors.black)
     mon.setCursorPos(x+8, y+1)
     mon.write(string.format("$%d", player.balance):sub(1, slotW - 8))
 
-    -- Row 2: chip row + bet amount
+    -- Row 2: chip row + bet
     drawChipRow(x, y+2, player.roundBet, 6, slotBg)
-    mon.setBackgroundColor(slotBg)
-    mon.setTextColor(colors.black)
+    mon.setBackgroundColor(slotBg); mon.setTextColor(colors.black)
     mon.setCursorPos(x+7, y+2)
     mon.write(string.format("$%d", player.roundBet):sub(1, slotW - 7))
 
-    -- Row 3: action / status
+    -- Row 3: status
     mon.setCursorPos(x, y+3)
     if isCurrent then
-        mon.setBackgroundColor(colors.cyan)
-        mon.setTextColor(colors.black)
+        mon.setBackgroundColor(colors.cyan); mon.setTextColor(colors.black)
         mon.write(string.format("%-" .. slotW .. "s", ">> YOUR TURN"):sub(1, slotW))
     elseif isWinner then
-        mon.setBackgroundColor(colors.yellow)
-        mon.setTextColor(colors.black)
+        mon.setBackgroundColor(colors.yellow); mon.setTextColor(colors.black)
         mon.write(string.format("%-" .. slotW .. "s", "** WINNER! **"):sub(1, slotW))
     elseif game.phase == "showdown" and not player.folded then
-        mon.setBackgroundColor(colors.lime)
-        mon.setTextColor(colors.black)
+        mon.setBackgroundColor(colors.lime); mon.setTextColor(colors.black)
         local handName = ""
         for _, r in ipairs(game.results) do
             if r.name == player.name then handName = r.handName; break end
         end
         mon.write(handName:sub(1, slotW))
     else
-        mon.setBackgroundColor(slotBg)
-        mon.setTextColor(colors.gray)
-        local status = player.folded and "--- folded ---" or ""
-        mon.write(string.format("%-" .. slotW .. "s", status):sub(1, slotW))
+        mon.setBackgroundColor(slotBg); mon.setTextColor(colors.gray)
+        mon.write(string.format("%-" .. slotW .. "s",
+            player.folded and "--- folded ---" or ""):sub(1, slotW))
     end
     mon.setBackgroundColor(colors.green)
 end
 
 local function drawEmptySlot(x, y, idx, slotW)
-    -- Green background (matches table)
-    mon.setBackgroundColor(colors.green)
-    mon.setTextColor(colors.lime)
+    mon.setBackgroundColor(colors.green); mon.setTextColor(colors.lime)
     for dy = 0, 3 do
-        mon.setCursorPos(x, y + dy)
-        mon.write(string.rep(" ", slotW))
+        mon.setCursorPos(x, y + dy); mon.write(string.rep(" ", slotW))
     end
     mon.setCursorPos(x, y)
     mon.write((idx .. ". [ empty ]"):sub(1, slotW))
@@ -294,46 +279,26 @@ local function drawTable()
     local W, H = mon.getSize()
     mfill(1, 1, W, H, " ", colors.green)
 
-    -- slotW: divide into ~4 columns, clamped 10-18
     local SLOT_H = 4
     local slotW  = math.max(10, math.min(18, math.floor((W - 4) / 4)))
-
-    -- Community cards: 5 x (5w+1spacing) = 29 wide, 9 tall
     local cardH   = 9
     local totalCW = 29
     local cardX   = math.max(slotW + 2, math.floor((W - totalCW) / 2) + 1)
     local cardY   = math.max(SLOT_H + 4, math.floor((H - cardH) / 2))
 
-    -- Seat X anchors
     local leftX   = 1
     local rightX  = W - slotW
     local centerX = math.floor(W / 2) - math.floor(slotW / 2)
-    local hasCenter = (centerX > leftX + slotW + 1) and
-                      (centerX + slotW - 1 < rightX - 1)
+    local hasCenter = (centerX > leftX + slotW + 1) and (centerX + slotW - 1 < rightX - 1)
 
-    -- Half-circle: top 3 + mid 2 flanking cards, no bottom row
-    --   2 (top-left)   3 (top-center*)   4 (top-right)
-    --   1 (mid-left)   [community cards] 5 (mid-right)
     local topY = 3
     local midY = cardY
     local seats
     if hasCenter then
-        seats = {
-            {leftX,   midY},
-            {leftX,   topY},
-            {centerX, topY},
-            {rightX,  topY},
-            {rightX,  midY},
-        }
+        seats = {{leftX,midY},{leftX,topY},{centerX,topY},{rightX,topY},{rightX,midY}}
     else
         local row2Y = topY + SLOT_H + 1
-        seats = {
-            {leftX,  midY},
-            {leftX,  topY},
-            {rightX, topY},
-            {rightX, row2Y},
-            {leftX,  row2Y},
-        }
+        seats = {{leftX,midY},{leftX,topY},{rightX,topY},{rightX,row2Y},{leftX,row2Y}}
     end
 
     for i = 1, 5 do
@@ -345,49 +310,38 @@ local function drawTable()
         end
     end
 
-    -- Header row 1 (drawn after seats so title stays visible)
     local title = "=== TEXAS HOLD'EM ==="
     mon.setCursorPos(math.floor((W - #title) / 2) + 1, 1)
-    mon.setBackgroundColor(colors.green)
-    mon.setTextColor(colors.yellow)
+    mon.setBackgroundColor(colors.green); mon.setTextColor(colors.yellow)
     mon.write(title)
 
-    -- Phase / turn row 2
     local phaseNames = {
         lobby="LOBBY", deal="CARDS DEALT",
         flop="FLOP", turn="TURN", river="RIVER", showdown="SHOWDOWN"
     }
     local phStr = "[ " .. (phaseNames[game.phase] or game.phase:upper()) .. " ]"
-    if game.betting then
-        phStr = phStr .. " " .. (currentPlayerName() or "")
-    end
+    if game.betting then phStr = phStr .. " " .. (currentPlayerName() or "") end
     mon.setCursorPos(math.floor((W - #phStr) / 2) + 1, 2)
-    mon.setBackgroundColor(colors.green)
-    mon.setTextColor(colors.white)
+    mon.setBackgroundColor(colors.green); mon.setTextColor(colors.white)
     mon.write(phStr)
 
-    -- Community cards
     for i = 1, 5 do
         drawMonCard(cardX + (i-1)*6, cardY, game.community[i])
     end
 
-    -- Pot: banner text first, then chip row centered below
     local potTxtRow = cardY + cardH + 1
     local potStr = "  POT: $" .. game.pot .. "  "
     mon.setCursorPos(math.floor((W - #potStr) / 2) + 1, potTxtRow)
-    mon.setBackgroundColor(colors.black)
-    mon.setTextColor(colors.yellow)
+    mon.setBackgroundColor(colors.black); mon.setTextColor(colors.yellow)
     mon.write(potStr)
     mon.setBackgroundColor(colors.green)
     if game.currentBet > 0 then
         local betStr = "  Bet: $" .. game.currentBet .. "  "
         mon.setCursorPos(math.floor((W - #betStr) / 2) + 1, potTxtRow + 1)
-        mon.setBackgroundColor(colors.black)
-        mon.setTextColor(colors.white)
+        mon.setBackgroundColor(colors.black); mon.setTextColor(colors.white)
         mon.write(betStr)
         mon.setBackgroundColor(colors.green)
     end
-    -- Chip row centered below pot text
     local chipRow = potTxtRow + 2
     if chipRow <= H - 1 then
         local potChips = getChipList(game.pot)
@@ -397,31 +351,25 @@ local function drawTable()
         end
     end
 
-    -- Winner banner (last row)
     if game.winner then
         local wStr = " WINNER: " .. game.winner .. " - " .. (game.winHand or "") .. " "
         if #wStr > W then wStr = wStr:sub(1, W) end
         mon.setCursorPos(math.floor((W - #wStr) / 2) + 1, H)
-        mon.setBackgroundColor(colors.yellow)
-        mon.setTextColor(colors.black)
+        mon.setBackgroundColor(colors.yellow); mon.setTextColor(colors.black)
         mon.write(wStr)
         mon.setBackgroundColor(colors.green)
     end
 
-    -- Dealer ID (bottom-right)
     local idStr = "ID:" .. os.getComputerID()
     mon.setCursorPos(W - #idStr, H)
-    mon.setBackgroundColor(colors.green)
-    mon.setTextColor(colors.gray)
+    mon.setBackgroundColor(colors.green); mon.setTextColor(colors.gray)
     mon.write(idStr)
 end
 
 -- TERMINAL
--- =====================================================
 local function drawTerminal()
     term.setBackgroundColor(colors.black)
-    term.clear()
-    term.setCursorPos(1, 1)
+    term.clear(); term.setCursorPos(1, 1)
     term.setTextColor(colors.yellow)
     print("=== POKER DEALER ===")
     term.setTextColor(colors.white)
@@ -431,9 +379,12 @@ local function drawTerminal()
     print(string.rep("-", 40))
     for i, p in ipairs(game.players) do
         local status = ""
-        if p.folded  then status = "FOLD"
-        elseif p.allIn then status = "ALL-IN"
+        if p.folded       then status = "FOLD"
+        elseif p.allIn    then status = "ALL-IN"
         elseif game.betting and i == game.actionIdx then status = "<-- TURN"
+        elseif i == game.dealerBtn then status = "[D]"
+        elseif i == game.sbIdx     then status = "[SB]"
+        elseif i == game.bbIdx     then status = "[BB]"
         end
         term.setTextColor(game.betting and i == game.actionIdx and colors.cyan or colors.lightGray)
         print(string.format("%-14s $%-6d $%-6d %s", p.name, p.balance, p.roundBet, status))
@@ -441,12 +392,16 @@ local function drawTerminal()
     term.setTextColor(colors.white)
     print(string.rep("-", 40))
     print("Pot: $" .. game.pot .. "  |  Bet: $" .. game.currentBet)
+    print("Blinds: SB=$" .. SMALL_BLIND .. "  BB=$" .. BIG_BLIND)
     print(string.rep("-", 40))
 
     if game.phase == "lobby" then
         if #game.players < MIN_PLAYERS then
             term.setTextColor(colors.red)
-            print("Waiting for at least " .. MIN_PLAYERS .. " players (" .. #game.players .. " now)")
+            print("Waiting for " .. MIN_PLAYERS .. "+ players (" .. #game.players .. " now)")
+        elseif game.timerStage == 2 then
+            term.setTextColor(colors.cyan)
+            print("Auto-starting in " .. game.countdown .. "s...  [ENTER] now")
         else
             term.setTextColor(colors.green)
             print("[ENTER] Start game (" .. #game.players .. " players)")
@@ -457,8 +412,13 @@ local function drawTerminal()
     elseif game.phase == "showdown" then
         term.setTextColor(colors.yellow)
         if game.winner then print("WINNER: " .. game.winner) end
-        term.setTextColor(colors.green)
-        print("[ENTER] New round")
+        if game.timerStage == 1 then
+            term.setTextColor(colors.lightGray)
+            print("Next round in " .. game.countdown .. "s  [ENTER] skip")
+        else
+            term.setTextColor(colors.green)
+            print("[ENTER] New round")
+        end
     end
 end
 
@@ -484,12 +444,11 @@ local function isBettingDone()
 end
 
 local function nextActionIdx()
-    local start = game.actionIdx
-    for _ = 1, #game.players do
-        game.actionIdx = game.actionIdx % #game.players + 1
+    local numP = #game.players
+    for _ = 1, numP do
+        game.actionIdx = game.actionIdx % numP + 1
         local p = game.players[game.actionIdx]
-        if not p.folded and not p.allIn then return true end
-        if game.actionIdx == start then break end
+        if p and not p.folded and not p.allIn then return true end
     end
     return false
 end
@@ -498,8 +457,8 @@ local function notifyTurn()
     if not game.betting then return end
     local p = game.players[game.actionIdx]
     if not p then return end
-    local canCheck  = (p.roundBet >= game.currentBet)
-    local callAmt   = math.max(0, game.currentBet - p.roundBet)
+    local canCheck = (p.roundBet >= game.currentBet)
+    local callAmt  = math.max(0, game.currentBet - p.roundBet)
     sendTo(p.id, {
         type       = "your_turn",
         canCheck   = canCheck,
@@ -513,25 +472,40 @@ local function notifyTurn()
 end
 
 -- =====================================================
--- FASE-FUNKSJONER
+-- PHASE FUNCTIONS
 -- =====================================================
+
+-- Forward declaration needed for mutual recursion
+local checkAutoAdvance
+
+-- Post-flop betting: reset bets, action starts left of dealer
 local function startBettingRound()
     game.betting    = true
     game.currentBet = 0
-    game.actionIdx  = 1
+    local numP = #game.players
+    game.actionIdx = (game.dealerBtn % numP) + 1
     for _, p in ipairs(game.players) do
         if not p.folded then
             p.roundBet = 0
             p.acted    = false
         end
     end
-    -- Find first non-folded player
-    while game.players[game.actionIdx] and game.players[game.actionIdx].folded do
-        game.actionIdx = game.actionIdx + 1
-        if game.actionIdx > #game.players then game.actionIdx = 1; break end
+    -- Skip folded/all-in to first active player
+    for _ = 1, numP do
+        local p = game.players[game.actionIdx]
+        if p and not p.folded and not p.allIn then break end
+        game.actionIdx = game.actionIdx % numP + 1
     end
     notifyTurn()
     broadcastState()
+    -- If everyone is all-in, auto-advance immediately
+    if isBettingDone() then checkAutoAdvance() end
+end
+
+local function startAutoTimer()
+    game.timerStage = 1
+    game.countdown  = ROUND_DELAY
+    game.autoTimer  = os.startTimer(1)
 end
 
 local function doShowdown()
@@ -541,7 +515,6 @@ local function doShowdown()
 
     local bestR, bestT = 0, {}
     local winners = {}
-
     for _, p in ipairs(game.players) do
         if not p.folded then
             local all = {}
@@ -555,7 +528,6 @@ local function doShowdown()
         end
     end
 
-    -- Distribute pot
     local share = math.floor(game.pot / math.max(1, #winners))
     local winNames = {}
     for _, w in ipairs(winners) do
@@ -564,7 +536,7 @@ local function doShowdown()
     end
 
     game.winner  = table.concat(winNames, " & ") .. (#winners > 1 and " (Split)" or "")
-    game.winHand = game.results[1] and game.results[1].handName or ""
+    game.winHand = ""
     for _, r in ipairs(game.results) do
         for _, w in ipairs(winners) do
             if r.name == w.name then game.winHand = r.handName; break end
@@ -580,6 +552,7 @@ local function doShowdown()
         playerData = playerDataList(),
         pot        = game.pot,
     })
+    startAutoTimer()
 end
 
 local function autoWin(winner)
@@ -598,36 +571,146 @@ local function autoWin(winner)
         playerData = playerDataList(),
         pot        = game.pot,
     })
+    startAutoTimer()
 end
 
-local function checkAutoAdvance()
-    -- Check if only one player remains
-    local n, last = countActive()
-    if n == 1 then autoWin(last); return end
-    -- Check if betting round is done
-    if not isBettingDone() then return end
-    game.betting = false
-    if     game.phase == "deal"  then
-        -- Show flop
-        cards.deal(game.deck)  -- burn
-        for _ = 1,3 do game.community[#game.community+1] = cards.deal(game.deck) end
-        game.phase = "flop"
-        broadcastState()
-        startBettingRound()
-    elseif game.phase == "flop"  then
-        cards.deal(game.deck)
-        game.community[#game.community+1] = cards.deal(game.deck)
-        game.phase = "turn"
-        broadcastState()
-        startBettingRound()
-    elseif game.phase == "turn"  then
-        cards.deal(game.deck)
-        game.community[#game.community+1] = cards.deal(game.deck)
-        game.phase = "river"
-        broadcastState()
-        startBettingRound()
-    elseif game.phase == "river" then
-        doShowdown()
+-- Loop to handle all phases, including all-in run-outs
+checkAutoAdvance = function()
+    while true do
+        local n, last = countActive()
+        if n == 1 then autoWin(last); return end
+        if not isBettingDone() then return end
+        game.betting = false
+
+        if game.phase == "deal" then
+            cards.deal(game.deck)
+            for _ = 1, 3 do game.community[#game.community+1] = cards.deal(game.deck) end
+            game.phase = "flop"
+            broadcastState()
+            startBettingRound()
+            return  -- startBettingRound loops back if all-in
+        elseif game.phase == "flop" then
+            cards.deal(game.deck)
+            game.community[#game.community+1] = cards.deal(game.deck)
+            game.phase = "turn"
+            broadcastState()
+            startBettingRound()
+            return
+        elseif game.phase == "turn" then
+            cards.deal(game.deck)
+            game.community[#game.community+1] = cards.deal(game.deck)
+            game.phase = "river"
+            broadcastState()
+            startBettingRound()
+            return
+        elseif game.phase == "river" then
+            doShowdown(); return
+        else
+            return
+        end
+    end
+end
+
+-- =====================================================
+-- START GAME AND RESET
+-- =====================================================
+local function startGame()
+    if #game.players < MIN_PLAYERS then return end
+
+    game.deck       = cards.newDeck()
+    cards.shuffle(game.deck)
+    game.community  = {}
+    game.winner     = nil
+    game.winHand    = nil
+    game.results    = {}
+    game.pot        = 0
+    game.currentBet = BIG_BLIND
+    game.phase      = "deal"
+    game.betting    = true
+    game.autoTimer  = nil
+    game.countdown  = 0
+    game.timerStage = 0
+
+    -- Rotate dealer button
+    local numP     = #game.players
+    game.dealerBtn = (game.dealerBtn % numP) + 1
+    game.sbIdx     = (game.dealerBtn % numP) + 1
+    game.bbIdx     = (game.sbIdx     % numP) + 1
+
+    -- Deal cards, reset player state
+    for _, p in ipairs(game.players) do
+        p.hand     = {cards.deal(game.deck), cards.deal(game.deck)}
+        p.roundBet = 0
+        p.totalBet = 0
+        p.folded   = false
+        p.allIn    = false
+        p.acted    = false
+    end
+
+    -- Post small blind
+    local sb    = game.players[game.sbIdx]
+    local sbAmt = math.min(SMALL_BLIND, sb.balance)
+    sb.balance  = sb.balance  - sbAmt
+    sb.roundBet = sbAmt
+    sb.totalBet = sbAmt
+    game.pot    = game.pot + sbAmt
+    if sb.balance == 0 then sb.allIn = true end
+
+    -- Post big blind
+    local bb    = game.players[game.bbIdx]
+    local bbAmt = math.min(BIG_BLIND, bb.balance)
+    bb.balance  = bb.balance  - bbAmt
+    bb.roundBet = bbAmt
+    bb.totalBet = bbAmt
+    game.pot    = game.pot + bbAmt
+    if bb.balance == 0 then bb.allIn = true end
+
+    -- Send cards
+    for _, p in ipairs(game.players) do
+        sendTo(p.id, {type="hand", cards=p.hand, playerName=p.name, phase="deal"})
+    end
+
+    -- Pre-flop: action starts after BB (UTG)
+    game.actionIdx = (game.bbIdx % numP) + 1
+    for _ = 1, numP do
+        local p = game.players[game.actionIdx]
+        if p and not p.folded and not p.allIn then break end
+        game.actionIdx = game.actionIdx % numP + 1
+    end
+
+    notifyTurn()
+    broadcastState()
+end
+
+local function resetLobby()
+    game.phase      = "lobby"
+    game.community  = {}
+    game.winner     = nil
+    game.winHand    = nil
+    game.results    = {}
+    game.pot        = 0
+    game.currentBet = 0
+    game.betting    = false
+    game.autoTimer  = nil
+    game.countdown  = 0
+    game.timerStage = 0
+    for _, p in ipairs(game.players) do
+        p.hand     = {}
+        p.roundBet = 0
+        p.totalBet = 0
+        p.folded   = false
+        p.allIn    = false
+        p.acted    = false
+    end
+    broadcast({type="lobby", playerData=playerDataList()})
+end
+
+local function removeBrokePlayers()
+    for i = #game.players, 1, -1 do
+        if game.players[i].balance <= 0 then
+            sendTo(game.players[i].id, {type="error", msg="Out of chips! Rejoin to continue."})
+            table.remove(game.players, i)
+        end
     end
 end
 
@@ -637,7 +720,7 @@ end
 local function handleAction(senderID, msg)
     if not game.betting then return end
     local p = game.players[game.actionIdx]
-    if not p or p.id ~= senderID then return end  -- not their turn
+    if not p or p.id ~= senderID then return end
 
     local action = msg.action
 
@@ -646,7 +729,7 @@ local function handleAction(senderID, msg)
         p.acted  = true
 
     elseif action == "check" then
-        if p.roundBet < game.currentBet then return end  -- invalid
+        if p.roundBet < game.currentBet then return end
         p.acted = true
 
     elseif action == "call" then
@@ -668,11 +751,8 @@ local function handleAction(senderID, msg)
         game.pot   = game.pot   + total
         game.currentBet = p.roundBet
         if p.balance == 0 then p.allIn = true end
-        -- Reset others' acted flag
-        for i2, p2 in ipairs(game.players) do
-            if p2 ~= p and not p2.folded and not p2.allIn then
-                p2.acted = false
-            end
+        for _, p2 in ipairs(game.players) do
+            if p2 ~= p and not p2.folded and not p2.allIn then p2.acted = false end
         end
         p.acted = true
 
@@ -686,15 +766,12 @@ local function handleAction(senderID, msg)
         if p.roundBet > game.currentBet then
             game.currentBet = p.roundBet
             for _, p2 in ipairs(game.players) do
-                if p2 ~= p and not p2.folded and not p2.allIn then
-                    p2.acted = false
-                end
+                if p2 ~= p and not p2.folded and not p2.allIn then p2.acted = false end
             end
         end
         p.acted = true
     end
 
-    -- Next player or end round
     if not isBettingDone() then
         nextActionIdx()
         notifyTurn()
@@ -704,60 +781,13 @@ local function handleAction(senderID, msg)
 end
 
 -- =====================================================
--- START GAME AND RESET
--- =====================================================
-local function startGame()
-    game.deck      = cards.newDeck()
-    cards.shuffle(game.deck)
-    game.community = {}
-    game.winner    = nil
-    game.winHand   = nil
-    game.results   = {}
-    game.pot       = 0
-    game.currentBet = 0
-    game.phase     = "deal"
-
-    for _, p in ipairs(game.players) do
-        p.hand     = {cards.deal(game.deck), cards.deal(game.deck)}
-        p.roundBet = 0
-        p.totalBet = 0
-        p.folded   = false
-        p.allIn    = false
-        p.acted    = false
-        sendTo(p.id, {type="hand", cards=p.hand, playerName=p.name, phase="deal"})
-    end
-
-    startBettingRound()
-end
-
-local function resetLobby()
-    game.phase      = "lobby"
-    game.community  = {}
-    game.winner     = nil
-    game.winHand    = nil
-    game.results    = {}
-    game.pot        = 0
-    game.currentBet = 0
-    game.betting    = false
-    for _, p in ipairs(game.players) do
-        p.hand     = {}
-        p.roundBet = 0
-        p.totalBet = 0
-        p.folded   = false
-        p.allIn    = false
-        p.acted    = false
-    end
-    broadcast({type="lobby", playerData=playerDataList()})
-end
-
--- =====================================================
 -- HANDLE PLAYER MESSAGES
 -- =====================================================
 local function handlePlayerMsg(senderID, msg)
     if msg.type == "join" then
-        if game.phase ~= "lobby" then
-            sendTo(senderID, {type="error", msg="Game is in progress."})
-            return
+        -- Allow joining in lobby or during showdown countdown (queued for next round)
+        if game.phase ~= "lobby" and game.phase ~= "showdown" then
+            sendTo(senderID, {type="error", msg="Game is in progress."}); return
         end
         if #game.players >= MAX_PLAYERS then
             sendTo(senderID, {type="error", msg="Table is full."}); return
@@ -769,7 +799,7 @@ local function handlePlayerMsg(senderID, msg)
                 return
             end
         end
-        local name = (msg.name or "Player"):sub(1,14):match("^%s*(.-)%s*$")
+        local name = (msg.name or "Player"):sub(1,14):match("^%s*(.-)%s*$") or ""
         if name == "" then name = "Player" .. (#game.players+1) end
         local balance = math.max(100, math.min(10000, tonumber(msg.balance) or 1000))
         game.players[#game.players+1] = {
@@ -789,35 +819,26 @@ local function handlePlayerMsg(senderID, msg)
         local wasCurrentPlayer = false
         for i, p in ipairs(game.players) do
             if p.id == senderID then
-                if game.betting and i == game.actionIdx then
-                    wasCurrentPlayer = true
-                end
-                -- Adjust actionIdx if needed
-                if i < game.actionIdx then
-                    game.actionIdx = game.actionIdx - 1
-                end
+                if game.betting and i == game.actionIdx then wasCurrentPlayer = true end
+                if i < game.actionIdx then game.actionIdx = game.actionIdx - 1 end
                 table.remove(game.players, i)
                 break
             end
         end
-        -- If it was their turn, advance
         if wasCurrentPlayer and game.betting and #game.players > 0 then
             if game.actionIdx > #game.players then game.actionIdx = 1 end
-            -- Check if the game can continue
             local n, last = countActive()
             if n <= 1 then
                 if last then autoWin(last) end
             elseif isBettingDone() then
                 checkAutoAdvance()
             else
-                -- Find next non-folded player
-                local found = false
                 for _ = 1, #game.players do
                     local p = game.players[game.actionIdx]
-                    if p and not p.folded and not p.allIn then found = true; break end
+                    if p and not p.folded and not p.allIn then break end
                     game.actionIdx = game.actionIdx % #game.players + 1
                 end
-                if found then notifyTurn() end
+                notifyTurn()
             end
         end
         broadcastState()
@@ -832,7 +853,8 @@ local function handlePlayerMsg(senderID, msg)
         for _, p in ipairs(game.players) do
             if p.id == senderID and p.hand and #p.hand > 0 then
                 sendTo(senderID, {type="hand", cards=p.hand, playerName=p.name, phase=game.phase})
-                if game.betting and game.players[game.actionIdx] and game.players[game.actionIdx].id == senderID then
+                if game.betting and game.players[game.actionIdx]
+                        and game.players[game.actionIdx].id == senderID then
                     notifyTurn()
                 end
                 break
@@ -852,9 +874,47 @@ while true do
 
     if event == "key" and a == keys.enter then
         if game.phase == "lobby" and #game.players >= MIN_PLAYERS then
+            game.autoTimer  = nil
+            game.timerStage = 0
             startGame()
         elseif game.phase == "showdown" then
+            -- Skip countdown, go straight to lobby then auto-start
+            removeBrokePlayers()
             resetLobby()
+            if #game.players >= MIN_PLAYERS then
+                game.timerStage = 2
+                game.countdown  = LOBBY_DELAY
+                game.autoTimer  = os.startTimer(1)
+            end
+        end
+        drawTable()
+        drawTerminal()
+
+    elseif event == "timer" and a == game.autoTimer then
+        game.countdown = game.countdown - 1
+        if game.countdown <= 0 then
+            if game.timerStage == 1 then
+                -- Post-round countdown done: go to lobby
+                removeBrokePlayers()
+                resetLobby()
+                if #game.players >= MIN_PLAYERS then
+                    game.timerStage = 2
+                    game.countdown  = LOBBY_DELAY
+                    game.autoTimer  = os.startTimer(1)
+                else
+                    game.autoTimer  = nil
+                    game.timerStage = 0
+                end
+            elseif game.timerStage == 2 then
+                -- Lobby delay done: start next round
+                game.autoTimer  = nil
+                game.timerStage = 0
+                if #game.players >= MIN_PLAYERS then
+                    startGame()
+                end
+            end
+        else
+            game.autoTimer = os.startTimer(1)
         end
         drawTable()
         drawTerminal()
